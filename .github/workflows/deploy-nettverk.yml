@@ -1,0 +1,181 @@
+name: Rull ut nettverk og app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'stacks/nettverk/**'
+      - 'stacks/app/**'
+      - 'modules/network/**'
+      - 'shared/backend.hcl'
+      - '.github/workflows/deploy-nettverk.yml'
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment (manual runs only)
+        type: choice
+        options: [dev, test]
+        default: dev
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: nettverk-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    environment: ${{ inputs.environment || 'dev' }}
+
+    defaults:
+      run:
+        working-directory: stacks/nettverk
+
+    env:
+      MILJO: ${{ inputs.environment || 'dev' }}
+
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      TF_INPUT: false
+      TF_IN_AUTOMATION: true
+
+    steps:
+      - name: Hent koden
+        uses: actions/checkout@v5
+
+      - name: Installer Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Logg inn i Azure
+        uses: Azure/login@v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Hvem er jeg?
+        run: az account show
+
+      - name: Hent parameterfila fra Key Vault
+        run: |
+          az keyvault secret show \
+            --vault-name "${{ secrets.KEYVAULT_NAME }}" \
+            --name "tfvars-$MILJO" \
+            --query value -o tsv > params.auto.tfvars
+
+      - name: Init
+        run: |
+          terraform init \
+            -backend-config="${{ github.workspace }}/shared/backend.hcl" \
+            -backend-config="key=env/$MILJO/nettverk.tfstate"
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Plan
+        run: terraform plan
+
+      - name: Apply
+        run: terraform apply -auto-approve
+
+      - name: Verifiser at nettverket finnes i Azure
+        run: |
+          RG=$(terraform output -raw resource_group_name)
+          VNET=$(terraform output -raw vnet_name)
+          STATE=$(az network vnet show --resource-group "$RG" --name "$VNET" \
+                    --query provisioningState -o tsv)
+          echo "$VNET i $RG: $STATE"
+          test "$STATE" = "Succeeded"
+
+      - name: Slett parameterfila
+        if: always()
+        run: rm -f params.auto.tfvars
+
+  app:
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+
+    defaults:
+      run:
+        working-directory: stacks/app
+
+    env:
+      MILJO: ${{ inputs.environment || 'dev' }}
+      ARM_USE_OIDC: true
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      TF_INPUT: false
+      TF_IN_AUTOMATION: true
+
+    steps:
+      - name: Hent koden
+        uses: actions/checkout@v5
+
+      - name: Installer Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Logg inn i Azure
+        uses: Azure/login@v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Hent parameterfila fra Key Vault
+        run: |
+          az keyvault secret show \
+            --vault-name "${{ secrets.KEYVAULT_NAME }}" \
+            --name "tfvars-$MILJO" \
+            --query value -o tsv > params.auto.tfvars
+
+      - name: Les state-adressen fra shared/backend.hcl
+        run: |
+          {
+            echo 'TF_VAR_state_backend<<EOF'
+            echo '{'
+            grep -E '^[a-z_]+[[:space:]]*=' "$GITHUB_WORKSPACE/shared/backend.hcl"
+            echo '}'
+            echo 'EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Init
+        run: |
+          terraform init \
+            -backend-config="${{ github.workspace }}/shared/backend.hcl" \
+            -backend-config="key=env/$MILJO/app.tfstate"
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Plan
+        run: terraform plan
+
+      - name: Apply
+        run: terraform apply -auto-approve
+
+      - name: Verifiser at nettverkskortet finnes i Azure
+        run: |
+          RG=$(terraform output -raw resource_group_name)
+          NIC=$(terraform output -raw nic_name)
+          STATE=$(az network nic show --resource-group "$RG" --name "$NIC" \
+                    --query provisioningState -o tsv)
+          echo "$NIC i $RG: $STATE"
+          test "$STATE" = "Succeeded"
+
+      - name: Slett parameterfila
+        if: always()
+        run: rm -f params.auto.tfvars
